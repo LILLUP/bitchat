@@ -20,27 +20,41 @@ struct NotificationStreamAssembler {
         var reset = false
         let maxFrameLength = TransportConfig.blePendingWriteBufferCapBytes
 
-        let minHeaderBytes = 14 // version + type + ttl + timestamp(8) + flags + length(2)
-        let minFramePrefix = minHeaderBytes + BinaryProtocol.senderIDSize
-
-        while buffer.count >= minFramePrefix {
-            guard let first = buffer.first else { break }
-            if first != 1 {
+        while buffer.count >= BinaryProtocol.v1HeaderSize + BinaryProtocol.senderIDSize {
+            guard let version = buffer.first else { break }
+            guard version == 1 || version == 2 else {
                 dropped.append(buffer.removeFirst())
                 continue
             }
 
-            guard buffer.count >= minHeaderBytes else { break }
+            let headerSize = BinaryProtocol.headerSize(for: version)
+            let framePrefix = headerSize + BinaryProtocol.senderIDSize
+            guard headerSize > 0 else {
+                dropped.append(buffer.removeFirst())
+                continue
+            }
+            guard buffer.count >= framePrefix else { break }
 
-            let headerBytes = Array(buffer.prefix(minFramePrefix))
-            guard headerBytes.count == minFramePrefix else { break }
-
-            let flags = headerBytes[11]
+            let flagsIndex = buffer.startIndex + 11
+            let flags = buffer[flagsIndex]
             let hasRecipient = (flags & BinaryProtocol.Flags.hasRecipient) != 0
             let hasSignature = (flags & BinaryProtocol.Flags.hasSignature) != 0
-            let payloadLen = (Int(headerBytes[12]) << 8) | Int(headerBytes[13])
 
-            var frameLength = minFramePrefix + payloadLen
+            let lengthOffset = 12
+            let payloadLength: Int
+            if version == 2 {
+                let lengthIndex = buffer.startIndex + lengthOffset
+                payloadLength =
+                    (Int(buffer[lengthIndex]) << 24) |
+                    (Int(buffer[lengthIndex + 1]) << 16) |
+                    (Int(buffer[lengthIndex + 2]) << 8) |
+                    Int(buffer[lengthIndex + 3])
+            } else {
+                let lengthIndex = buffer.startIndex + lengthOffset
+                payloadLength = (Int(buffer[lengthIndex]) << 8) | Int(buffer[lengthIndex + 1])
+            }
+
+            var frameLength = framePrefix + payloadLength
             if hasRecipient { frameLength += BinaryProtocol.recipientIDSize }
             if hasSignature { frameLength += BinaryProtocol.signatureSize }
 
@@ -51,12 +65,12 @@ struct NotificationStreamAssembler {
             }
 
             if buffer.count < frameLength {
-                // Check if a new frame start exists within the incomplete buffer; if so, drop leading partial bytes.
-                if let nextStart = buffer.dropFirst().firstIndex(of: 1) {
+                if let nextStart = buffer.dropFirst().firstIndex(where: { $0 == 1 || $0 == 2 }) {
                     let dropCount = buffer.distance(from: buffer.startIndex, to: nextStart)
                     if dropCount > 0 {
+                        let removed = buffer.prefix(dropCount)
                         buffer.removeFirst(dropCount)
-                        dropped.append(1) // treat as dropped partial start
+                        dropped.append(contentsOf: removed)
                     }
                 }
                 break
@@ -135,11 +149,22 @@ final class BLEService: NSObject {
     
     // 4. Efficient Message Deduplication
     private let messageDeduplicator = MessageDeduplicator()
+    private lazy var mediaDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        return formatter
+    }()
     
     // 5. Fragment Reassembly (necessary for messages > MTU)
     private struct FragmentKey: Hashable { let sender: UInt64; let id: UInt64 }
     private var incomingFragments: [FragmentKey: [Int: Data]] = [:]
     private var fragmentMetadata: [FragmentKey: (type: UInt8, total: Int, timestamp: Date)] = [:]
+    private struct ActiveTransferState {
+        let totalFragments: Int
+        var sentFragments: Int
+        var workItems: [DispatchWorkItem]
+    }
+    private var activeTransfers: [String: ActiveTransferState] = [:]
     // Backoff for peripherals that recently timed out connecting
     private var recentConnectTimeouts: [String: Date] = [:] // Peripheral UUID -> last timeout
     
@@ -807,10 +832,18 @@ final class BLEService: NSObject {
         stopServices()
         
         // Clear all sessions and peers
-        collectionsQueue.sync(flags: .barrier) {
+        let cancelledTransfers: [(id: String, items: [DispatchWorkItem])] = collectionsQueue.sync(flags: .barrier) {
+            let entries = activeTransfers.map { ($0.key, $0.value.workItems) }
             peers.removeAll()
             incomingFragments.removeAll()
             fragmentMetadata.removeAll()
+            activeTransfers.removeAll()
+            return entries
+        }
+
+        for entry in cancelledTransfers {
+            entry.items.forEach { $0.cancel() }
+            TransferProgressManager.shared.cancel(id: entry.id)
         }
         
         // Clear processed messages
@@ -866,11 +899,81 @@ final class BLEService: NSObject {
     func getNoiseService() -> NoiseEncryptionService {
         return noiseService
     }
+
+    func cancelTransfer(_ transferId: String) {
+        collectionsQueue.async(flags: .barrier) { [weak self] in
+            guard let self = self, let state = self.activeTransfers.removeValue(forKey: transferId) else { return }
+            state.workItems.forEach { $0.cancel() }
+            TransferProgressManager.shared.cancel(id: transferId)
+            SecureLogger.debug("🛑 Cancelled transfer \(transferId.prefix(8))…", category: .session)
+        }
+    }
     
     func getFingerprint(for peerID: String) -> String? {
         return getPeerFingerprint(peerID)
     }
-    
+
+    func sendFileBroadcast(_ filePacket: BitchatFilePacket) {
+        messageQueue.async { [weak self] in
+            guard let self = self else { return }
+            guard let payload = filePacket.encode() else {
+                SecureLogger.error("❌ Failed to encode file packet for broadcast", category: .session)
+                return
+            }
+
+            let packet = BitchatPacket(
+                type: MessageType.fileTransfer.rawValue,
+                senderID: self.myPeerIDData,
+                recipientID: nil,
+                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                payload: payload,
+                signature: nil,
+                ttl: self.messageTTL,
+                version: 2
+            )
+
+            let senderHex = packet.senderID.hexEncodedString()
+            let dedupID = "\(senderHex)-\(packet.timestamp)-\(packet.type)"
+            self.messageDeduplicator.markProcessed(dedupID)
+
+            SecureLogger.debug("📁 Broadcasting file transfer payload bytes=\(payload.count)", category: .session)
+            self.broadcastPacket(packet)
+            self.gossipSyncManager?.onPublicPacketSeen(packet)
+        }
+    }
+
+    func sendFilePrivate(_ filePacket: BitchatFilePacket, to peerID: String) {
+        messageQueue.async { [weak self] in
+            guard let self = self else { return }
+            guard let payload = filePacket.encode() else {
+                SecureLogger.error("❌ Failed to encode file packet for private send", category: .session)
+                return
+            }
+            guard let recipientData = Data(hexString: peerID) else {
+                SecureLogger.error("❌ Invalid recipient peer ID for file transfer: \(peerID)", category: .session)
+                return
+            }
+
+            var packet = BitchatPacket(
+                type: MessageType.fileTransfer.rawValue,
+                senderID: self.myPeerIDData,
+                recipientID: recipientData,
+                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                payload: payload,
+                signature: nil,
+                ttl: self.messageTTL,
+                version: 2
+            )
+
+            if let signed = self.noiseService.signPacket(packet) {
+                packet = signed
+            }
+
+            SecureLogger.debug("📁 Sending private file transfer to \(peerID.prefix(8))… bytes=\(payload.count)", category: .session)
+            self.broadcastPacket(packet)
+        }
+    }
+
     func sendMessage(_ content: String, mentions: [String] = [], to recipientID: String? = nil, messageID: String? = nil, timestamp: Date? = nil) {
         // Ensure this runs on message queue to avoid main thread blocking
         messageQueue.async { [weak self] in
@@ -1093,6 +1196,10 @@ final class BLEService: NSObject {
     private func broadcastPacket(_ packet: BitchatPacket) {
         // Encode once using a small per-type padding policy, then delegate by type
         let padForBLE = padPolicy(for: packet.type)
+        if packet.type == MessageType.fileTransfer.rawValue {
+            sendFragmentedPacket(packet, pad: padForBLE, maxChunk: nil, directedOnlyPeer: nil)
+            return
+        }
         guard let data = packet.toBinaryData(padding: padForBLE) else {
             SecureLogger.error("❌ Failed to convert packet to binary data", category: .session)
             return
@@ -1361,6 +1468,8 @@ final class BLEService: NSObject {
         let fragments = stride(from: 0, to: fullData.count, by: safeChunk).map { offset in
             Data(fullData[offset..<min(offset + safeChunk, fullData.count)])
         }
+        guard !fragments.isEmpty else { return }
+
         // Lightweight pacing to reduce floods and allow BLE buffers to drain
         // Also briefly pause scanning during long fragment trains to save battery
         let totalFragments = fragments.count
@@ -1375,6 +1484,19 @@ final class BLEService: NSObject {
                 }
             }
         }
+        let perFragMs = (directedOnlyPeer != nil || packet.recipientID != nil) ? TransportConfig.bleFragmentSpacingDirectedMs : TransportConfig.bleFragmentSpacingMs
+
+        let transferId: String? = {
+            guard packet.type == MessageType.fileTransfer.rawValue else { return nil }
+            let id = packet.payload.sha256Hex()
+            collectionsQueue.sync(flags: .barrier) {
+                self.activeTransfers[id] = ActiveTransferState(totalFragments: totalFragments, sentFragments: 0, workItems: [])
+            }
+            TransferProgressManager.shared.start(id: id, totalFragments: totalFragments)
+            return id
+        }()
+
+        var scheduledItems: [(item: DispatchWorkItem, index: Int)] = []
 
         for (index, fragment) in fragments.enumerated() {
             var payload = Data()
@@ -1383,8 +1505,7 @@ final class BLEService: NSObject {
             payload.append(contentsOf: withUnsafeBytes(of: UInt16(fragments.count).bigEndian) { Data($0) })
             payload.append(packet.type)
             payload.append(fragment)
-            
-            // Choose recipient for the fragment: directed override if provided
+
             let fragmentRecipient: Data? = {
                 if let only = directedOnlyPeer { return Data(hexString: only) }
                 return packet.recipientID
@@ -1399,15 +1520,49 @@ final class BLEService: NSObject {
                 signature: nil,
                 ttl: packet.ttl
             )
-            // Pace fragments with small jitter to avoid bursts
-            let perFragMs = (directedOnlyPeer != nil || packet.recipientID != nil) ? TransportConfig.bleFragmentSpacingDirectedMs : TransportConfig.bleFragmentSpacingMs
+
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                if let transferId = transferId {
+                    let isActive = self.collectionsQueue.sync { self.activeTransfers[transferId] != nil }
+                    guard isActive else { return }
+                }
+                self.broadcastPacket(fragmentPacket)
+                if let transferId = transferId {
+                    self.markFragmentSent(transferId: transferId)
+                }
+            }
+
+            scheduledItems.append((item: workItem, index: index))
+        }
+
+        if let transferId = transferId {
+            let workItems = scheduledItems.map { $0.item }
+            collectionsQueue.async(flags: .barrier) { [weak self] in
+                guard let self = self, var state = self.activeTransfers[transferId] else { return }
+                state.workItems = workItems
+                self.activeTransfers[transferId] = state
+            }
+        }
+
+        for (workItem, index) in scheduledItems {
             let delayMs = index * perFragMs
-            messageQueue.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
-                self?.broadcastPacket(fragmentPacket)
+            messageQueue.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: workItem)
+        }
+    }
+
+    private func markFragmentSent(transferId: String) {
+        collectionsQueue.async(flags: .barrier) { [weak self] in
+            guard let self = self, var state = self.activeTransfers[transferId] else { return }
+            state.sentFragments = min(state.sentFragments + 1, state.totalFragments)
+            self.activeTransfers[transferId] = state
+            TransferProgressManager.shared.recordFragmentSent(id: transferId)
+            if state.sentFragments >= state.totalFragments {
+                self.activeTransfers.removeValue(forKey: transferId)
             }
         }
     }
-    
+
     private func handleFragment(_ packet: BitchatPacket, from peerID: String) {
         // Don't process our own fragments
         if peerID == myPeerID {
@@ -1550,6 +1705,9 @@ final class BLEService: NSObject {
         case .fragment:
             handleFragment(packet, from: senderID)
             
+        case .fileTransfer:
+            handleFileTransfer(packet, from: senderID)
+
         case .leave:
             handleLeave(packet, from: senderID)
             
@@ -1870,6 +2028,148 @@ final class BLEService: NSObject {
             self?.delegate?.didReceivePublicMessage(from: peerID, nickname: senderNickname, content: content, timestamp: ts)
         }
     }
+
+    private func handleFileTransfer(_ packet: BitchatPacket, from peerID: String) {
+        if peerID == myPeerID && packet.ttl != 0 { return }
+
+        var accepted = false
+        var senderNickname = ""
+
+        if peerID == myPeerID {
+            accepted = true
+            senderNickname = myNickname
+        } else if let info = peers[peerID], info.isVerifiedNickname {
+            accepted = true
+            senderNickname = info.nickname
+            let hasCollision = peers.values.contains { $0.isConnected && $0.nickname == info.nickname && $0.id != peerID } || (myNickname == info.nickname)
+            if hasCollision {
+                senderNickname += "#" + String(peerID.prefix(4))
+            }
+        } else if let signature = packet.signature, let packetData = packet.toBinaryDataForSigning() {
+            let candidates = identityManager.getCryptoIdentitiesByPeerIDPrefix(peerID)
+            for candidate in candidates {
+                if let signingKey = candidate.signingPublicKey,
+                   noiseService.verifySignature(signature, for: packetData, publicKey: signingKey) {
+                    accepted = true
+                    if let social = identityManager.getSocialIdentity(for: candidate.fingerprint) {
+                        senderNickname = social.localPetname ?? social.claimedNickname
+                    } else {
+                        senderNickname = "anon" + String(peerID.prefix(4))
+                    }
+                    break
+                }
+            }
+            if !accepted && packet.ttl == 0 {
+                accepted = true
+                senderNickname = "anon" + String(peerID.prefix(4))
+            }
+        } else if packet.ttl == 0 {
+            accepted = true
+            senderNickname = "anon" + String(peerID.prefix(4))
+        }
+
+        guard accepted else {
+            SecureLogger.warning("🚫 Dropping file transfer from unverified or unknown peer \(peerID.prefix(8))…", category: .security)
+            return
+        }
+
+        // Skip directed packets that are not intended for us
+        if let recipient = packet.recipientID {
+            let recipientHex = recipient.hexEncodedString()
+            if recipientHex != myPeerID && !recipient.allSatisfy({ $0 == 0xFF }) {
+                return
+            }
+        }
+
+        if let recipient = packet.recipientID,
+           recipient.allSatisfy({ $0 == 0xFF }) {
+            gossipSyncManager?.onPublicPacketSeen(packet)
+        } else if packet.recipientID == nil {
+            gossipSyncManager?.onPublicPacketSeen(packet)
+        }
+
+        guard let filePacket = BitchatFilePacket.decode(packet.payload) else {
+            SecureLogger.error("❌ Failed to decode file transfer payload", category: .session)
+            return
+        }
+
+        guard FileTransferLimits.isValidPayload(filePacket.content.count) else {
+            SecureLogger.warning("🚫 Dropping file transfer exceeding size cap (\(filePacket.content.count) bytes)", category: .security)
+            return
+        }
+
+        let mime = (filePacket.mimeType ?? "application/octet-stream").lowercased()
+        let category: IncomingMediaCategory
+        if mime.hasPrefix("audio/") {
+            category = .audio
+        } else if mime.hasPrefix("image/") {
+            category = .image
+        } else {
+            category = .other
+        }
+
+        let fallbackExt = defaultExtension(for: mime) ?? (category == .image ? "jpg" : category == .audio ? "m4a" : "bin")
+        let subdirectory: String
+        let prefix: String
+        switch category {
+        case .audio:
+            subdirectory = "voicenotes/incoming"
+            prefix = "voice"
+        case .image:
+            subdirectory = "images/incoming"
+            prefix = "image"
+        case .other:
+            subdirectory = "files/incoming"
+            prefix = "file"
+        }
+
+        guard let destination = saveIncomingFile(
+            data: filePacket.content,
+            preferredName: filePacket.fileName,
+            subdirectory: subdirectory,
+            fallbackExtension: fallbackExt,
+            defaultPrefix: prefix
+        ) else {
+            return
+        }
+
+        let marker: String
+        switch category {
+        case .audio:
+            marker = "[voice] \(destination.path)"
+        case .image:
+            marker = "[image] \(destination.path)"
+        case .other:
+            marker = "[file] \(destination.path)"
+        }
+
+        let isPrivateMessage: Bool = {
+            guard let recipient = packet.recipientID else { return false }
+            return recipient.hexEncodedString() == myPeerID
+        }()
+
+        if isPrivateMessage {
+            updatePeerLastSeen(peerID)
+        }
+
+        let ts = Date(timeIntervalSince1970: Double(packet.timestamp) / 1000)
+        let message = BitchatMessage(
+            sender: senderNickname,
+            content: marker,
+            timestamp: ts,
+            isRelay: false,
+            originalSender: nil,
+            isPrivate: isPrivateMessage,
+            recipientNickname: nil,
+            senderPeerID: peerID
+        )
+
+        SecureLogger.debug("📁 Stored incoming media from \(peerID.prefix(8))… -> \(destination.lastPathComponent)", category: .session)
+
+        notifyUI { [weak self] in
+            self?.delegate?.didReceiveMessage(message)
+        }
+    }
     
     private func handleNoiseHandshake(_ packet: BitchatPacket, from peerID: String) {
         // Use NoiseEncryptionService for handshake processing
@@ -1991,6 +2291,94 @@ final class BLEService: NSObject {
     
     // MARK: - Helper Functions
     
+    private enum IncomingMediaCategory {
+        case audio
+        case image
+        case other
+    }
+
+    private func applicationFilesDirectory() throws -> URL {
+        let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let filesDir = base.appendingPathComponent("files", isDirectory: true)
+        try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true, attributes: nil)
+        return filesDir
+    }
+
+    private func sanitizeFileName(_ name: String?, defaultName: String, fallbackExtension: String?) -> String {
+        var candidate = name ?? ""
+        candidate = candidate.replacingOccurrences(of: "\\", with: "/")
+        candidate = candidate.components(separatedBy: "/").last ?? defaultName
+        candidate = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        if candidate.isEmpty { candidate = defaultName }
+        let invalid = CharacterSet(charactersIn: "<>:\"|?*")
+        candidate = candidate.components(separatedBy: invalid).joined(separator: "_")
+        if candidate.isEmpty { candidate = defaultName }
+        if candidate.count > 120 {
+            candidate = String(candidate.prefix(120))
+        }
+        if let fallbackExtension = fallbackExtension, (candidate as NSString).pathExtension.isEmpty {
+            candidate += ".\(fallbackExtension)"
+        }
+        return candidate
+    }
+
+    private func uniqueFileURL(in directory: URL, fileName: String) -> URL {
+        var candidate = directory.appendingPathComponent(fileName)
+        if !FileManager.default.fileExists(atPath: candidate.path) {
+            return candidate
+        }
+        let baseName = (fileName as NSString).deletingPathExtension
+        let ext = (fileName as NSString).pathExtension
+        var counter = 1
+        repeat {
+            let newName = ext.isEmpty ? "\(baseName) (\(counter))" : "\(baseName) (\(counter)).\(ext)"
+            candidate = directory.appendingPathComponent(newName)
+            counter += 1
+        } while FileManager.default.fileExists(atPath: candidate.path)
+        return candidate
+    }
+
+    private func saveIncomingFile(data: Data, preferredName: String?, subdirectory: String, fallbackExtension: String?, defaultPrefix: String) -> URL? {
+        do {
+            let base = try applicationFilesDirectory().appendingPathComponent(subdirectory, isDirectory: true)
+            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true, attributes: nil)
+            let timestamp = mediaDateFormatter.string(from: Date())
+            let defaultName = "\(defaultPrefix)_\(timestamp)"
+            let sanitized = sanitizeFileName(preferredName, defaultName: defaultName, fallbackExtension: fallbackExtension)
+            let destination = uniqueFileURL(in: base, fileName: sanitized)
+            try data.write(to: destination, options: .atomic)
+            return destination
+        } catch {
+            SecureLogger.error("❌ Failed to persist incoming media: \(error)", category: .session)
+            return nil
+        }
+    }
+
+    private func defaultExtension(for mimeType: String) -> String? {
+        switch mimeType.lowercased() {
+        case "audio/mp4", "audio/m4a", "audio/aac":
+            return "m4a"
+        case "audio/mpeg":
+            return "mp3"
+        case "audio/wav", "audio/x-wav":
+            return "wav"
+        case "audio/ogg":
+            return "ogg"
+        case "image/jpeg":
+            return "jpg"
+        case "image/png":
+            return "png"
+        case "image/webp":
+            return "webp"
+        case "image/gif":
+            return "gif"
+        case "application/pdf":
+            return "pdf"
+        default:
+            return nil
+        }
+    }
+
     private func sendLeave() {
         SecureLogger.debug("👋 Sending leave announcement", category: .session)
         let packet = BitchatPacket(
