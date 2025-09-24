@@ -1609,8 +1609,10 @@ final class BLEService: NSObject {
             }
             incomingFragments[key] = [:]
             fragmentMetadata[key] = (originalType, total, Date())
+            SecureLogger.debug("📦 Started fragment assembly id=\(String(format: "%016llx", fragU64)) total=\(total)", category: .session)
         }
         incomingFragments[key]?[index] = Data(fragmentData)
+        SecureLogger.debug("📦 Fragment \(index + 1)/\(total) (len=\(fragmentData.count)) for id=\(String(format: "%016llx", fragU64))", category: .session)
 
         // Check if complete
         if let fragments = incomingFragments[key],
@@ -1625,6 +1627,7 @@ final class BLEService: NSObject {
             
             // Decode the original packet bytes we reassembled, so flags/compression are preserved
             if let originalPacket = BinaryProtocol.decode(reassembled) {
+                SecureLogger.debug("✅ Reassembled packet id=\(String(format: "%016llx", fragU64)) type=\(originalPacket.type) bytes=\(reassembled.count)", category: .session)
                 handleReceivedPacket(originalPacket, from: peerID)
             } else {
                 SecureLogger.error("❌ Failed to decode reassembled packet (type=\(originalType), total=\(total))", category: .session)
