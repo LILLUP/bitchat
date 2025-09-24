@@ -366,6 +366,8 @@ struct ContentView: View {
             return MessageDisplayItem(id: "\(contextKey)|\(message.id)", message: message)
         }
 
+        let lastMessageID = messageItems.last?.id
+
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
@@ -424,6 +426,14 @@ struct ContentView: View {
             }
             .onAppear {
                 scrollToBottom(on: proxy, privatePeer: privatePeer, isAtBottom: isAtBottom)
+            }
+            .onChange(of: lastMessageID) { newValue in
+                guard let target = newValue else { return }
+                DispatchQueue.main.async {
+                    withAnimation(.easeOut(duration: TransportConfig.uiAnimationMediumSeconds)) {
+                        proxy.scrollTo(target, anchor: .bottom)
+                    }
+                }
             }
         }
     }
