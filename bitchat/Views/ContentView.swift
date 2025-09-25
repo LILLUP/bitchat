@@ -9,8 +9,11 @@
 import SwiftUI
 #if os(iOS)
 import UIKit
+#endif
+#if canImport(PhotosUI)
 import PhotosUI
-#else
+#endif
+#if os(macOS)
 import AppKit
 #endif
 import UniformTypeIdentifiers
@@ -71,9 +74,8 @@ struct ContentView: View {
     @State private var recordingDuration: TimeInterval = 0
     @State private var recordingTimer: Timer?
     @State private var recordingStartDate: Date?
-    @State private var showImageImporter = false
     @State private var showFileImporter = false
-#if os(iOS)
+#if canImport(PhotosUI)
     @State private var showPhotoPicker = false
     @State private var selectedPhotoPickerItem: PhotosPickerItem?
 #endif
@@ -213,23 +215,16 @@ struct ContentView: View {
                 FingerprintView(viewModel: viewModel, peerID: peerID)
             }
         }
-#if os(iOS)
+#if canImport(PhotosUI)
         .photosPicker(isPresented: $showPhotoPicker, selection: $selectedPhotoPickerItem, matching: .images)
         .onChange(of: selectedPhotoPickerItem) { newItem in
             guard let item = newItem else { return }
             Task { await handlePhotoSelection(item) }
         }
-        .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
-            handleImportResult(result, handler: handleImportedFile)
-        }
-#else
-        .fileImporter(isPresented: $showImageImporter, allowedContentTypes: [.image], allowsMultipleSelection: false) { result in
-            handleImportResult(result, handler: handleImportedImage)
-        }
-        .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
-            handleImportResult(result, handler: handleImportedFile)
-        }
 #endif
+        .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
+            handleImportResult(result, handler: handleImportedFile)
+        }
         .sheet(isPresented: Binding(
             get: { imagePreviewURL != nil },
             set: { presenting in if !presenting { imagePreviewURL = nil } }
@@ -239,24 +234,15 @@ struct ContentView: View {
             }
         }
         .confirmationDialog("Attach", isPresented: $showAttachmentActions, titleVisibility: .visible) {
-#if os(iOS)
+#if canImport(PhotosUI)
             Button("Image") {
                 showAttachmentActions = false
                 DispatchQueue.main.async { showPhotoPicker = true }
             }
-#else
-            Button("Image") {
-                showAttachmentActions = false
-                DispatchQueue.main.async { showImageImporter = true }
-            }
 #endif
             Button("File") {
                 showAttachmentActions = false
-#if os(iOS)
                 DispatchQueue.main.async { showFileImporter = true }
-#else
-                DispatchQueue.main.async { showFileImporter = true }
-#endif
             }
             Button("Cancel", role: .cancel) {}
         }
@@ -1830,7 +1816,7 @@ private extension ContentView {
         }
     }
 
-#if os(iOS)
+#if canImport(PhotosUI)
     func handlePhotoSelection(_ item: PhotosPickerItem) async {
         defer { Task { @MainActor in selectedPhotoPickerItem = nil } }
         do {
@@ -1840,7 +1826,9 @@ private extension ContentView {
                     .appendingPathExtension("jpg")
                 try data.write(to: tempURL, options: .atomic)
                 await MainActor.run {
-                    viewModel.sendImage(from: tempURL)
+                    viewModel.sendImage(from: tempURL) {
+                        try? FileManager.default.removeItem(at: tempURL)
+                    }
                 }
             }
         } catch {
@@ -1848,12 +1836,6 @@ private extension ContentView {
         }
     }
 #endif
-
-    func handleImportedImage(url: URL) async {
-        await MainActor.run {
-            viewModel.sendImage(from: url)
-        }
-    }
 
     func handleImportedFile(url: URL) async {
         do {
