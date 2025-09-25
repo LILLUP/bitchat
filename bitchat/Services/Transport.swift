@@ -46,8 +46,8 @@ protocol Transport: AnyObject {
     func sendFavoriteNotification(to peerID: String, isFavorite: Bool)
     func sendBroadcastAnnounce()
     func sendDeliveryAck(for messageID: String, to peerID: String)
-    func sendFileBroadcast(_ packet: BitchatFilePacket)
-    func sendFilePrivate(_ packet: BitchatFilePacket, to peerID: String)
+    func sendFileBroadcast(_ packet: BitchatFilePacket, transferId: String)
+    func sendFilePrivate(_ packet: BitchatFilePacket, to peerID: String, transferId: String)
     func cancelTransfer(_ transferId: String)
 
     // QR verification (optional for transports)
@@ -62,8 +62,8 @@ protocol Transport: AnyObject {
 extension Transport {
     func sendVerifyChallenge(to peerID: String, noiseKeyHex: String, nonceA: Data) {}
     func sendVerifyResponse(to peerID: String, noiseKeyHex: String, nonceA: Data) {}
-    func sendFileBroadcast(_ packet: BitchatFilePacket) {}
-    func sendFilePrivate(_ packet: BitchatFilePacket, to peerID: String) {}
+    func sendFileBroadcast(_ packet: BitchatFilePacket, transferId: String) {}
+    func sendFilePrivate(_ packet: BitchatFilePacket, to peerID: String, transferId: String) {}
     func cancelTransfer(_ transferId: String) {}
 }
 

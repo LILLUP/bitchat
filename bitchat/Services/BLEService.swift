@@ -927,7 +927,7 @@ final class BLEService: NSObject {
         return getPeerFingerprint(peerID)
     }
 
-    func sendFileBroadcast(_ filePacket: BitchatFilePacket) {
+    func sendFileBroadcast(_ filePacket: BitchatFilePacket, transferId: String) {
         messageQueue.async { [weak self] in
             guard let self = self else { return }
             guard let payload = filePacket.encode() else {
@@ -951,12 +951,12 @@ final class BLEService: NSObject {
             self.messageDeduplicator.markProcessed(dedupID)
 
             SecureLogger.debug("📁 Broadcasting file transfer payload bytes=\(payload.count)", category: .session)
-            self.broadcastPacket(packet)
+            self.broadcastPacket(packet, transferId: transferId)
             self.gossipSyncManager?.onPublicPacketSeen(packet)
         }
     }
 
-    func sendFilePrivate(_ filePacket: BitchatFilePacket, to peerID: String) {
+    func sendFilePrivate(_ filePacket: BitchatFilePacket, to peerID: String, transferId: String) {
         messageQueue.async { [weak self] in
             guard let self = self else { return }
             guard let payload = filePacket.encode() else {
@@ -984,7 +984,7 @@ final class BLEService: NSObject {
             }
 
             SecureLogger.debug("📁 Sending private file transfer to \(peerID.prefix(8))… bytes=\(payload.count)", category: .session)
-            self.broadcastPacket(packet)
+            self.broadcastPacket(packet, transferId: transferId)
         }
     }
 
@@ -1207,11 +1207,11 @@ final class BLEService: NSObject {
     
     // MARK: - Packet Broadcasting
     
-    private func broadcastPacket(_ packet: BitchatPacket) {
+    private func broadcastPacket(_ packet: BitchatPacket, transferId: String? = nil) {
         // Encode once using a small per-type padding policy, then delegate by type
         let padForBLE = padPolicy(for: packet.type)
         if packet.type == MessageType.fileTransfer.rawValue {
-            sendFragmentedPacket(packet, pad: padForBLE, maxChunk: nil, directedOnlyPeer: nil)
+            sendFragmentedPacket(packet, pad: padForBLE, maxChunk: nil, directedOnlyPeer: nil, transferId: transferId)
             return
         }
         guard let data = packet.toBinaryData(padding: padForBLE) else {
@@ -1472,7 +1472,7 @@ final class BLEService: NSObject {
     
     // MARK: - Fragmentation (Required for messages > BLE MTU)
     
-    private func sendFragmentedPacket(_ packet: BitchatPacket, pad: Bool, maxChunk: Int? = nil, directedOnlyPeer: String? = nil) {
+    private func sendFragmentedPacket(_ packet: BitchatPacket, pad: Bool, maxChunk: Int? = nil, directedOnlyPeer: String? = nil, transferId: String? = nil) {
         guard let fullData = packet.toBinaryData(padding: pad) else { return }
         // Fragment the unpadded frame; each fragment will be encoded independently
         
@@ -1500,9 +1500,9 @@ final class BLEService: NSObject {
         }
         let perFragMs = (directedOnlyPeer != nil || packet.recipientID != nil) ? TransportConfig.bleFragmentSpacingDirectedMs : TransportConfig.bleFragmentSpacingMs
 
-        let transferId: String? = {
+        let transferIdentifier: String? = {
             guard packet.type == MessageType.fileTransfer.rawValue else { return nil }
-            let id = packet.payload.sha256Hex()
+            let id = transferId ?? packet.payload.sha256Hex()
             collectionsQueue.sync(flags: .barrier) {
                 self.activeTransfers[id] = ActiveTransferState(totalFragments: totalFragments, sentFragments: 0, workItems: [])
             }
@@ -1537,12 +1537,12 @@ final class BLEService: NSObject {
 
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
-                if let transferId = transferId {
+                if let transferId = transferIdentifier {
                     let isActive = self.collectionsQueue.sync { self.activeTransfers[transferId] != nil }
                     guard isActive else { return }
                 }
                 self.broadcastPacket(fragmentPacket)
-                if let transferId = transferId {
+                if let transferId = transferIdentifier {
                     self.markFragmentSent(transferId: transferId)
                 }
             }
@@ -1550,7 +1550,7 @@ final class BLEService: NSObject {
             scheduledItems.append((item: workItem, index: index))
         }
 
-        if let transferId = transferId {
+        if let transferId = transferIdentifier {
             let workItems = scheduledItems.map { $0.item }
             collectionsQueue.async(flags: .barrier) { [weak self] in
                 guard let self = self, var state = self.activeTransfers[transferId] else { return }
