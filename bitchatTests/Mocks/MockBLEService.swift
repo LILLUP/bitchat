@@ -187,6 +187,14 @@ final class MockBLEService: NSObject {
             }
         }
     }
+
+    func sendFileBroadcast(_ packet: BitchatFilePacket, transferId: String) {
+        // Tests currently ignore file transfer flows; keep stub for protocol conformance.
+    }
+
+    func sendFilePrivate(_ packet: BitchatFilePacket, to peerID: String, transferId: String) {
+        // Tests currently ignore file transfer flows; keep stub for protocol conformance.
+    }
     
     func sendPrivateMessage(_ content: String, to recipientPeerID: String, recipientNickname: String, messageID: String) {
         let message = BitchatMessage(
