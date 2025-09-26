@@ -1985,17 +1985,20 @@ final class BLEService: NSObject {
         var accepted = false
         var senderNickname: String = ""
 
+        // Snapshot peers dictionary to avoid mutating-while-iterating crashes when checking collisions.
+        let peersSnapshot = collectionsQueue.sync { peers }
+
         // If the packet is from ourselves (e.g., recovered via sync TTL==0), accept immediately
         if peerID == myPeerID {
             accepted = true
             senderNickname = myNickname
         }
-        else if let info = peers[peerID], info.isVerifiedNickname {
+        else if let info = peersSnapshot[peerID], info.isVerifiedNickname {
             // Known verified peer path
             accepted = true
             senderNickname = info.nickname
             // Handle nickname collisions
-            let hasCollision = peers.values.contains { $0.isConnected && $0.nickname == info.nickname && $0.id != peerID } || (myNickname == info.nickname)
+            let hasCollision = peersSnapshot.values.contains { $0.isConnected && $0.nickname == info.nickname && $0.id != peerID } || (myNickname == info.nickname)
             if hasCollision {
                 senderNickname += "#" + String(peerID.prefix(4))
             }
@@ -2068,20 +2071,22 @@ final class BLEService: NSObject {
         var accepted = false
         var senderNickname = ""
 
+        let peersSnapshot = collectionsQueue.sync { peers }
+
         if peerID == myPeerID {
             accepted = true
             senderNickname = myNickname
-        } else if let info = peers[peerID], info.isVerifiedNickname {
+        } else if let info = peersSnapshot[peerID], info.isVerifiedNickname {
             accepted = true
             senderNickname = info.nickname
-            let hasCollision = peers.values.contains { $0.isConnected && $0.nickname == info.nickname && $0.id != peerID } || (myNickname == info.nickname)
+            let hasCollision = peersSnapshot.values.contains { $0.isConnected && $0.nickname == info.nickname && $0.id != peerID } || (myNickname == info.nickname)
             if hasCollision {
                 senderNickname += "#" + String(peerID.prefix(4))
             }
-        } else if let info = peers[peerID], info.isConnected {
+        } else if let info = peersSnapshot[peerID], info.isConnected {
             accepted = true
             senderNickname = info.nickname.isEmpty ? "anon" + String(peerID.prefix(4)) : info.nickname
-            let hasCollision = peers.values.contains { $0.isConnected && $0.nickname == info.nickname && $0.id != peerID } || (myNickname == info.nickname)
+            let hasCollision = peersSnapshot.values.contains { $0.isConnected && $0.nickname == info.nickname && $0.id != peerID } || (myNickname == info.nickname)
             if hasCollision {
                 senderNickname += "#" + String(peerID.prefix(4))
             }
